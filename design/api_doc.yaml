@@ -1,0 +1,465 @@
+openapi: 3.0.3
+info:
+  title: Distributed Chat API
+  version: 0.1.0
+  description: |
+    REST API for the distributed chat system, plus the realtime gateway's WebSocket endpoint.
+
+    **Identity.** There is no authentication in this version. Every request (except `/healthz`)
+    identifies the caller with the `X-User-ID` header or the `user` query parameter. The value is
+    an arbitrary user name string.
+
+    **Access.** Anyone can read and post in any room. Subscriptions only control who receives
+    real-time pushes. Creating a room or posting in it subscribes the caller automatically.
+
+    **Idempotency.** Rooms and messages carry client-generated UUIDv7s. Repeating a create with the
+    same ID and identical contents returns `200` with the existing resource, so retries are safe.
+    The same ID with different contents returns `409`.
+
+    **Eventual consistency.** The API is eventually consistent: a successful write may not be
+    visible to every subsequent request right away. In particular, a `404` for a room that was
+    just created can be transient. Clients should retry `404`s on recently created rooms for a
+    few seconds.
+
+    No deletes in this version: rooms and messages are permanent.
+servers:
+  - url: http://localhost:8080
+    description: Local development (Docker Compose)
+
+security:
+  - UserHeader: []
+  - UserQuery: []
+
+tags:
+  - name: rooms
+  - name: messages
+  - name: subscriptions
+  - name: realtime
+  - name: health
+
+paths:
+  /rooms:
+    post:
+      tags: [rooms]
+      operationId: createRoom
+      summary: Create a room
+      description: Creates a room and subscribes the caller to it. Room names are not unique.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+      responses:
+        '201':
+          description: Room created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '200':
+          description: A room with this ID and identical contents already exists (idempotent retry).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [rooms]
+      operationId: listRooms
+      summary: List rooms
+      description: Lists rooms, newest first. With `subscribed=true`, lists only the caller's subscribed rooms.
+      parameters:
+        - name: subscribed
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Before'
+      responses:
+        '200':
+          description: A page of rooms.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /rooms/{roomId}:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [rooms]
+      operationId: getRoom
+      summary: Get a room
+      responses:
+        '200':
+          description: The room.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /rooms/{roomId}/messages:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [messages]
+      operationId: listMessages
+      summary: Query messages in a room
+      description: |
+        Returns messages newest first. With no cursor, returns the newest `limit` messages.
+        `before` pages backward through history; `after` returns messages newer than the given ID
+        (used to catch up after reconnecting). `before` and `after` are mutually exclusive.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Before'
+        - name: after
+          in: query
+          required: false
+          description: Return only messages with IDs greater than this UUIDv7.
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: A page of messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [messages]
+      operationId: sendMessage
+      summary: Send a message to a room
+      description: |
+        Stores the message and, atomically with it, subscribes the sender to the room if not
+        already subscribed. On success, a `message.created` event is published for
+        real-time delivery to the room's subscribers, including the sender. A repeated send with an
+        existing ID is a no-op and does not change the sender's subscription.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        '201':
+          description: Message stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '200':
+          description: A message with this ID and identical contents already exists (idempotent retry).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /rooms/{roomId}/subscription:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    put:
+      tags: [subscriptions]
+      operationId: subscribe
+      summary: Subscribe the caller to a room
+      description: Idempotent. Subscribing when already subscribed succeeds with no change.
+      responses:
+        '204':
+          description: The caller is subscribed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [subscriptions]
+      operationId: unsubscribe
+      summary: Unsubscribe the caller from a room
+      description: |
+        Idempotent. Unsubscribing when not subscribed succeeds with no change. The caller can still
+        read and post; posting again resubscribes them.
+      responses:
+        '204':
+          description: The caller is not subscribed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /rooms/{roomId}/subscribers:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [subscriptions]
+      operationId: listSubscribers
+      summary: List a room's current subscribers
+      description: Eventually consistent; may briefly omit or include users whose subscription changed recently.
+      responses:
+        '200':
+          description: Current subscribers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriberList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /ws:
+    get:
+      tags: [realtime]
+      operationId: connectRealtime
+      summary: Open a real-time WebSocket (served by the realtime gateway)
+      description: |
+        Upgrades to a push-only WebSocket for the identified user. The server sends a JSON
+        `RealtimeEvent` for every message posted in any room the user is subscribed to, including
+        the user's own messages. Frames sent by the client are ignored. The server sends WebSocket
+        pings; clients must answer with pongs or be disconnected.
+
+        Pushes are not stored. To avoid gaps, clients should open this connection first, then fetch
+        history with `GET /rooms/{roomId}/messages`, deduplicating by message ID.
+
+        OpenAPI cannot fully describe WebSocket traffic; the event payload is defined in
+        `components.schemas.RealtimeEvent`.
+      responses:
+        '101':
+          description: Switching protocols; the connection is now a WebSocket.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /healthz:
+    get:
+      tags: [health]
+      operationId: healthCheck
+      summary: Health check for the load balancer
+      description: |
+        Served by both the chat API and the realtime gateway; requires no identity. Returns `200`
+        only when the service is able to handle requests.
+      security: []
+      responses:
+        '200':
+          description: Healthy.
+        '503':
+          description: Unhealthy.
+
+components:
+  securitySchemes:
+    UserHeader:
+      type: apiKey
+      in: header
+      name: X-User-ID
+      description: Caller identity (not authenticated).
+    UserQuery:
+      type: apiKey
+      in: query
+      name: user
+      description: Caller identity as a query parameter, for clients that cannot set headers (such as WebSockets).
+
+  parameters:
+    RoomId:
+      name: roomId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    Before:
+      name: before
+      in: query
+      required: false
+      description: Return only items with IDs less than this UUIDv7 (page backward).
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+  responses:
+    BadRequest:
+      description: |
+        Invalid request: validation failure, missing identity, malformed or non-v7 UUID, or both `before`
+        and `after` supplied.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: |
+        The room does not exist, or is not yet visible. May be transient if the room was created
+        recently.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: A resource with this ID already exists with different contents.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      description: |
+        A UUIDv7 (RFC 9562). The leading 48 bits are a millisecond timestamp, so IDs sort by
+        creation time, which `before`/`after` pagination relies on. UUIDv4 is not accepted.
+      example: 019a6b2e-4c1d-7f3a-9b8e-2d5c7a1f0e46
+
+    UserId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      example: alice
+
+    CreateRoomRequest:
+      type: object
+      required: [name]
+      properties:
+        id:
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
+          description: Optional client-generated ID. The server generates one if omitted.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: general
+      additionalProperties: false
+
+    Room:
+      type: object
+      required: [id, name, created_by, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          example: general
+        created_by:
+          $ref: '#/components/schemas/UserId'
+        created_at:
+          type: string
+          format: date-time
+
+    RoomList:
+      type: object
+      required: [rooms, has_more]
+      properties:
+        rooms:
+          type: array
+          items:
+            $ref: '#/components/schemas/Room'
+        has_more:
+          type: boolean
+
+    SendMessageRequest:
+      type: object
+      required: [id, body]
+      properties:
+        id:
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
+          description: Required client-generated ID; makes retries safe.
+        body:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          example: hi bob
+      additionalProperties: false
+
+    Message:
+      type: object
+      required: [id, room_id, sender, body, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        room_id:
+          $ref: '#/components/schemas/Uuid'
+        sender:
+          $ref: '#/components/schemas/UserId'
+        body:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          description: Set by the server, not the client.
+
+    MessageList:
+      type: object
+      required: [messages, has_more]
+      properties:
+        messages:
+          type: array
+          description: Newest first.
+          items:
+            $ref: '#/components/schemas/Message'
+        has_more:
+          type: boolean
+
+    SubscriberList:
+      type: object
+      required: [subscribers]
+      properties:
+        subscribers:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserId'
+
+    RealtimeEvent:
+      type: object
+      description: Pushed to clients over `/ws`.
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [message.created]
+        message:
+          $ref: '#/components/schemas/Message'
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_request
+                - missing_identity
+                - invalid_cursor
+                - room_not_found
+                - id_conflict
+            message:
+              type: string
+              description: Human-readable detail.
